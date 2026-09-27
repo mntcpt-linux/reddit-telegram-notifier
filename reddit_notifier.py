@@ -1,163 +1,180 @@
-
 import os
 import time
 import json
 import logging
 from pathlib import Path
-from urllib.parse import quote
 
-import feedparser
+import praw
 import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ===== CONFIGURATION =====
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-
+# =========================
+# Cấu hình
+# =========================
 SUBREDDIT = "PathOfExile2"
-POLL_INTERVAL = 60  # Kiểm tra mỗi 60 giây
+TARGET_FLAIR = "Giveaway"
 
-SEEN_FILE = Path("seen_posts.json")
+POLL_INTERVAL = 60
+STATE_FILE = Path("seen_posts.json")
 
-RSS_URL = (
-    f"https://www.reddit.com/r/{SUBREDDIT}/search.rss"
-    "?q=flair%3AGiveaway&restrict_sr=1&sort=new"
+REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID")
+REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
+REDDIT_USER_AGENT = os.getenv(
+    "REDDIT_USER_AGENT",
+    "personal-giveaway-notifier/1.0"
 )
 
-HEADERS = {
-    "User-Agent": "PersonalGiveawayNotifier/1.0"
-}
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
 
-def load_seen():
-    """Đọc danh sách bài đã xử lý."""
-    if SEEN_FILE.exists():
-        try:
-            return set(json.loads(SEEN_FILE.read_text(encoding="utf-8")))
-        except (json.JSONDecodeError, OSError):
-            logging.warning("Không đọc được seen_posts.json")
-    return set()
+# =========================
+# Khởi tạo Reddit API
+# =========================
+def create_reddit_client():
+    if not REDDIT_CLIENT_ID or not REDDIT_CLIENT_SECRET:
+        raise ValueError("Thiếu thông tin xác thực Reddit API.")
 
-
-def save_seen(seen):
-    """Lưu danh sách bài đã xử lý."""
-    SEEN_FILE.write_text(
-        json.dumps(list(seen), ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    return praw.Reddit(
+        client_id=REDDIT_CLIENT_ID,
+        client_secret=REDDIT_CLIENT_SECRET,
+        user_agent=REDDIT_USER_AGENT,
+        check_for_async=False,
     )
 
 
-def fetch_posts():
-    """Lấy bài đăng từ RSS."""
-    response = requests.get(
-        RSS_URL,
-        headers=HEADERS,
-        timeout=20,
+# =========================
+# Đọc và lưu trạng thái
+# =========================
+def load_seen_posts():
+    if not STATE_FILE.exists():
+        return set()
+
+    try:
+        with STATE_FILE.open("r", encoding="utf-8") as f:
+            return set(json.load(f))
+    except (json.JSONDecodeError, OSError):
+        logging.warning("Không đọc được file trạng thái.")
+        return set()
+
+
+def save_seen_posts(seen_ids):
+    with STATE_FILE.open("w", encoding="utf-8") as f:
+        json.dump(list(seen_ids), f, ensure_ascii=False, indent=2)
+
+
+# =========================
+# Gửi thông báo Telegram
+# =========================
+def send_telegram_message(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        raise ValueError("Thiếu Telegram Bot Token hoặc Chat ID.")
+
+    url = (
+        f"https://api.telegram.org/bot"
+        f"{TELEGRAM_BOT_TOKEN}/sendMessage"
     )
-    response.raise_for_status()
-
-    feed = feedparser.parse(response.content)
-
-    if feed.bozo:
-        logging.warning("RSS có thể không hợp lệ: %s", feed.bozo_exception)
-
-    return feed.entries
-
-
-def send_telegram(message):
-    """Gửi thông báo đến Telegram."""
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
     response = requests.post(
         url,
-        data={
-            "chat_id": CHAT_ID,
+        json={
+            "chat_id": TELEGRAM_CHAT_ID,
             "text": message,
-            "disable_web_page_preview": True,
+            "disable_web_page_preview": False,
         },
         timeout=20,
     )
+
     response.raise_for_status()
-
     result = response.json()
+
     if not result.get("ok"):
-        raise RuntimeError(f"Telegram API error: {result}")
+        raise RuntimeError(f"Telegram API lỗi: {result}")
 
 
-def get_post_id(entry):
-    """Tạo ID ổn định cho mỗi bài đăng."""
-    return entry.get("id") or entry.get("link", "")
-
-
-def format_message(entry):
-    title = entry.get("title", "(Không có tiêu đề)")
-    link = entry.get("link", "")
-    published = entry.get("published", "Không rõ")
+# =========================
+# Tạo nội dung thông báo
+# =========================
+def format_post(submission):
+    title = submission.title
+    url = f"https://www.reddit.com{submission.permalink}"
+    author = submission.author.name if submission.author else "[deleted]"
 
     return (
-        "🎁 GIVEAWAY MỚI — Path of Exile 2\n\n"
+        "🎁 Giveaway mới trong r/PathOfExile2!\n\n"
         f"📌 {title}\n\n"
-        f"🕒 {published}\n"
-        f"🔗 {link}"
+        f"🏷 Flair: {submission.link_flair_text or 'N/A'}\n"
+        f"👤 Tác giả: u/{author}\n"
+        f"🔗 {url}"
     )
 
 
+# =========================
+# Theo dõi bài đăng mới
+# =========================
 def main():
-    if not BOT_TOKEN or not CHAT_ID:
-        raise SystemExit(
-            "Thiếu TELEGRAM_BOT_TOKEN hoặc TELEGRAM_CHAT_ID trong .env"
-        )
+    reddit = create_reddit_client()
+    subreddit = reddit.subreddit(SUBREDDIT)
 
-    seen = load_seen()
+    seen_ids = load_seen_posts()
 
-    logging.info("Đang khởi động theo dõi r/%s", SUBREDDIT)
+    # Nếu chạy lần đầu, ghi nhận bài mới nhất làm mốc.
+    # Không gửi thông báo cho các bài đã tồn tại trước đó.
+    if not seen_ids:
+        latest_posts = list(subreddit.new(limit=1))
 
-    # Lần đầu chạy: ghi nhận bài hiện có, không gửi thông báo hàng loạt.
-    if not seen:
-        try:
-            entries = fetch_posts()
-            for entry in entries:
-                post_id = get_post_id(entry)
-                if post_id:
-                    seen.add(post_id)
+        if latest_posts:
+            seen_ids.add(latest_posts[0].id)
+            save_seen_posts(seen_ids)
 
-            save_seen(seen)
-            logging.info("Đã ghi nhận %d bài hiện có.", len(seen))
-        except Exception as exc:
-            logging.warning("Không thể khởi tạo RSS: %s", exc)
+        logging.info("Đã thiết lập mốc theo dõi ban đầu.")
+
+    logging.info(
+        "Bắt đầu theo dõi r/%s với flair '%s'.",
+        SUBREDDIT,
+        TARGET_FLAIR,
+    )
 
     while True:
         try:
-            entries = fetch_posts()
+            posts = list(subreddit.new(limit=100))
 
-            # RSS thường trả bài mới trước, nên xử lý bài cũ trước.
-            new_entries = []
+            # Xử lý từ bài cũ đến bài mới để thông báo đúng thứ tự.
+            new_posts = [
+                post for post in reversed(posts)
+                if post.id not in seen_ids
+            ]
 
-            for entry in entries:
-                post_id = get_post_id(entry)
-                if post_id and post_id not in seen:
-                    new_entries.append((post_id, entry))
+            for post in new_posts:
+                seen_ids.add(post.id)
 
-            for post_id, entry in reversed(new_entries):
-                try:
-                    send_telegram(format_message(entry))
-                    logging.info("Đã gửi: %s", entry.get("title", post_id))
-                except Exception:
-                    logging.exception("Gửi Telegram thất bại")
-                    continue
+                flair = (post.link_flair_text or "").strip()
 
-                seen.add(post_id)
-                save_seen(seen)
+                if flair.casefold() == TARGET_FLAIR.casefold():
+                    message = format_post(post)
+
+                    try:
+                        send_telegram_message(message)
+                        logging.info("Đã gửi thông báo: %s", post.id)
+                    except Exception:
+                        logging.exception(
+                            "Không gửi được thông báo cho bài %s",
+                            post.id,
+                        )
+
+            # Giới hạn kích thước file trạng thái.
+            seen_ids = set(list(seen_ids)[-5000:])
+            save_seen_posts(seen_ids)
 
         except Exception:
-            logging.exception("Lỗi khi kiểm tra RSS")
+            logging.exception("Lỗi khi kiểm tra Reddit.")
 
         time.sleep(POLL_INTERVAL)
 
